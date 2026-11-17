@@ -25,7 +25,7 @@
 set -euo pipefail
 umask 077
 
-AGENT_VERSION="1.2.0"
+AGENT_VERSION="1.2.1"
 CONF="${PCVE_CONF:-/etc/nightwarden-agent.conf}"
 BIN="${PCVE_BIN:-/usr/local/sbin/nightwarden-agent}"  # PCVE_BIN jen pro testy
 UNIT="nightwarden-agent"
@@ -520,7 +520,9 @@ update_agent() {  # 1.1.0: aktualizace jedním příkazem, konfigurace (URL, kl�
   local url ca sha=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --sha256) sha="$(printf '%s' "${2:-}" | tr 'A-F' 'a-f')"; shift 2 ;;
+      # review #212: bez hodnoty / s prázdnou hodnotou chyba (dřív tiše „bez kontroly“, chybějící argument = shift 2)
+      --sha256) [ $# -ge 2 ] && [ -n "$2" ] || die "--sha256 needs 64 hexadecimal characters"
+                sha="$(printf '%s' "$2" | tr 'A-F' 'a-f')"; shift 2 ;;
       *) die "unknown option $1" ;;
     esac
   done
