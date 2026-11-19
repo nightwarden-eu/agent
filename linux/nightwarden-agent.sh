@@ -9,6 +9,8 @@
 #                       proměnné zahazuje; `sudo NW_AGENT_KEY=… bash` by dal klíč do argumentů sudo);
 #                       --key pcve_… dál funguje, ale zůstane v historii a v `ps`
 #                       volitelně --ca /cesta/k/ca.pem (vlastní certifikační autorita, např. Caddy v domácí síti)
+#                       volitelně --interval 4h|12h|1d|7d (#290, jak často se hlásit; výchozí 1d = denně)
+#   Četnost (1.3.0):    sudo nightwarden-agent configure --interval 12h   (změní plánování, konfigurace zůstane)
 #   Ruční odeslání:     sudo nightwarden-agent run
 #   Aktualizace:        sudo nightwarden-agent update   (stáhne agenta ze serveru z konfigurace, atomicky nahradí)
 #                       sudo nightwarden-agent update --sha256 <hash>   (#210: jen se shodným SHA-256, např. z Release)
@@ -25,8 +27,10 @@
 set -euo pipefail
 umask 077
 
-AGENT_VERSION="1.2.1"
+AGENT_VERSION="1.3.0"
 CONF="${PCVE_CONF:-/etc/nightwarden-agent.conf}"
+INTERVALS="4h 12h 1d 7d"  # #290: povolené četnosti hlášení (server zná stejný seznam, core.agent.INTERVALS)
+DEFAULT_INTERVAL="1d"
 BIN="${PCVE_BIN:-/usr/local/sbin/nightwarden-agent}"  # PCVE_BIN jen pro testy
 UNIT="nightwarden-agent"
 ROOT="${PCVE_ROOT:-}"  # jen pro testy: kořen pro /etc/systemd, /etc/cron.d a /run/systemd
@@ -183,7 +187,7 @@ payload() {
   kernel="${PCVE_TEST_KERNEL:-$(uname -r)}"
   pkgs_file="$(mktemp)"
   fmt="$(collect_packages 2>&1 >"$pkgs_file" | tail -n1)"
-  printf '{"agent":{"version":%s,"platform":"linux"},' "$(jstr "$AGENT_VERSION")"
+  printf '{"agent":{"version":%s,"platform":"linux","interval":%s},' "$(jstr "$AGENT_VERSION")" "$(jstr "$(current_interval)")"
   printf '"hostname":%s,"machine_id":%s,"ip":%s,' "$(jstr "$host")" "$(jstr "$machine_id")" "$(jstr "$ip")"
   printf '"os":{"family":"linux","id":%s,"version_id":%s,"name":%s,"kernel":%s},' \
     "$(jstr "$(os_release_value ID)")" "$(jstr "$(os_release_value VERSION_ID)")" \
@@ -370,10 +374,11 @@ read_key() {  # $1 = --key, $2 = --key-file; výsledek v proměnné KEY_VALUE
 }
 
 install_agent() {
-  local url="" key="" keyfile="" ca="" offline="" dir="" prefix=""
+  local url="" key="" keyfile="" ca="" offline="" dir="" prefix="" interval="$DEFAULT_INTERVAL"
   while [ $# -gt 0 ]; do
     case "$1" in
       --offline) offline=1; shift ;;
+      --interval) interval="${2:-}"; shift 2 ;;
       --dir) dir="${2:-}"; shift 2 ;;
       --key-prefix) prefix="${2:-}"; shift 2 ;;
       --url) url="${2:-}"; shift 2 ;;
@@ -384,7 +389,8 @@ install_agent() {
     esac
   done
   [ "$(id -u)" = 0 ] || die "install must run as root (sudo)"
-  if [ -n "$offline" ]; then install_offline "$dir" "$key" "$keyfile" "$prefix"; return; fi
+  valid_interval "$interval" || die "--interval must be one of: $INTERVALS"
+  if [ -n "$offline" ]; then install_offline "$dir" "$key" "$keyfile" "$prefix" "$interval"; return; fi
   case "$url" in https://*) ;; *) die "--url must start with https://";; esac
   read_key "$key" "$keyfile"
   key="$KEY_VALUE"
@@ -401,20 +407,20 @@ install_agent() {
   else  # spuštěno přes rouru (curl … | bash): skript stáhnout znovu, jen stejnou verzi (#125)
     fetch_agent "$url" "$ca" same
   fi
-  printf 'URL=%s\nKEY=%s\nCA=%s\n' "$url" "$key" "$ca" >"$CONF"
+  printf 'URL=%s\nKEY=%s\nCA=%s\nINTERVAL=%s\n' "$url" "$key" "$ca" "$interval" >"$CONF"
   chmod 0600 "$CONF"; chown root:root "$CONF"
   if [ -e "$ROOT/etc/$LEGACY.conf" ] || [ -e "$ROOT/usr/local/sbin/$LEGACY" ]; then
     remove_legacy
     echo "nightwarden-agent: replaced the previous project-cve-agent (same machine, same asset)"
   fi
 
-  schedule
+  schedule "$interval"
 }
 
 # Offline instalace (1.2.0): bez sítě a bez curl; v konfiguraci jen složka a prefix klíče (tajemství klíče se na
-# izolovaný stroj neukládá). $1 = složka, $2 = --key, $3 = --key-file, $4 = --key-prefix
+# izolovaný stroj neukládá). $1 = složka, $2 = --key, $3 = --key-file, $4 = --key-prefix, $5 = --interval
 install_offline() {
-  local dir="$1" prefix="$4"
+  local dir="$1" prefix="$4" interval="${5:-$DEFAULT_INTERVAL}"
   [ -n "$dir" ] || die "--offline needs --dir /path/to/reports"
   case "$dir" in /*) ;; *) die "--dir must be an absolute path";; esac
   if [ -z "$prefix" ]; then
@@ -433,13 +439,31 @@ install_offline() {
   else
     die "offline install needs the script as a file: bash nightwarden-agent.sh install --offline …"
   fi
-  printf 'MODE=offline\nDIR=%s\nKEY_PREFIX=%s\n' "$dir" "$prefix" >"$CONF"
+  printf 'MODE=offline\nDIR=%s\nKEY_PREFIX=%s\nINTERVAL=%s\n' "$dir" "$prefix" "$interval" >"$CONF"
   chmod 0600 "$CONF"; chown root:root "$CONF"
-  RW_DIR="$dir" schedule  # ProtectSystem=strict: zápis jen do složky s hlášeními
+  RW_DIR="$dir" schedule "$interval"  # ProtectSystem=strict: zápis jen do složky s hlášeními
 }
 
-# Denní spuštění `run` (systemd timer, jinak cron); první běh hned
+valid_interval() {  # #290: jen hodnota z INTERVALS
+  case " $INTERVALS " in *" ${1:-} "*) return 0 ;; *) return 1 ;; esac
+}
+
+current_interval() {  # INTERVAL z konfigurace (starší instalace bez něj = denně)
+  local v=""
+  [ -r "$CONF" ] && v="$(conf INTERVAL 2>/dev/null || true)"
+  valid_interval "$v" && echo "$v" || echo "$DEFAULT_INTERVAL"
+}
+
+# Pravidelné spuštění `run` podle intervalu (systemd timer, jinak cron); první běh hned, když $2 != norun.
+# Náhodné zpoždění úměrné intervalu, ať se stroje nehlásí všechny naráz.
 schedule() {
+  local interval="${1:-$DEFAULT_INTERVAL}" first="${2:-run}" cal delay label m h
+  case "$interval" in
+    4h)  cal="*-*-* 00/4:00:00"; delay="1h"; label="every 4 hours" ;;
+    12h) cal="*-*-* 00/12:00:00"; delay="3h"; label="every 12 hours" ;;
+    7d)  cal="weekly"; delay="1d"; label="weekly" ;;
+    *)   cal="daily"; delay="6h"; label="daily" ;;
+  esac
   if command -v systemctl >/dev/null 2>&1 && [ -d "$ROOT/run/systemd/system" ]; then
     cat >"$ROOT/etc/systemd/system/$UNIT.service" <<EOF
 [Unit]
@@ -463,11 +487,11 @@ ReadWritePaths=$RW_DIR}
 EOF
     cat >"$ROOT/etc/systemd/system/$UNIT.timer" <<EOF
 [Unit]
-Description=NightWarden agent, once a day
+Description=NightWarden agent, $label
 
 [Timer]
-OnCalendar=daily
-RandomizedDelaySec=6h
+OnCalendar=$cal
+RandomizedDelaySec=$delay
 Persistent=true
 
 [Install]
@@ -475,13 +499,46 @@ WantedBy=timers.target
 EOF
     systemctl daemon-reload
     systemctl enable --now $UNIT.timer >/dev/null
-    echo "nightwarden-agent: installed (systemd timer, daily with random delay). First report now:"
+    [ "$first" = run ] || { systemctl restart $UNIT.timer >/dev/null; echo "nightwarden-agent: reports $label (systemd timer)"; return; }
+    echo "nightwarden-agent: installed (systemd timer, $label with random delay). First report now:"
     systemctl start $UNIT.service && journalctl -u $UNIT.service -n 3 --no-pager -o cat 2>/dev/null || true
-  else  # bez systemd: cron s náhodnou minutou a hodinou
-    echo "$((RANDOM % 60)) $((RANDOM % 24)) * * * root $BIN run >/dev/null 2>&1" >"$ROOT/etc/cron.d/$UNIT"
+  else  # bez systemd: cron s náhodnou minutou (a hodinou v rámci intervalu)
+    m=$((RANDOM % 60))
+    case "$interval" in
+      4h)  h="$((RANDOM % 4))-23/4"; echo "$m $h * * * root $BIN run >/dev/null 2>&1" ;;
+      12h) h="$((RANDOM % 12))-23/12"; echo "$m $h * * * root $BIN run >/dev/null 2>&1" ;;
+      7d)  echo "$m $((RANDOM % 24)) * * $((RANDOM % 7)) root $BIN run >/dev/null 2>&1" ;;
+      *)   echo "$m $((RANDOM % 24)) * * * root $BIN run >/dev/null 2>&1" ;;
+    esac >"$ROOT/etc/cron.d/$UNIT"
     chmod 0644 "$ROOT/etc/cron.d/$UNIT"
-    echo "nightwarden-agent: installed (cron, daily). First report now:"
+    [ "$first" = run ] || { echo "nightwarden-agent: reports $label (cron)"; return; }
+    echo "nightwarden-agent: installed (cron, $label). First report now:"
     "$BIN" run
+  fi
+}
+
+# configure --interval X (#290): změní četnost u nainstalovaného agenta; ostatní konfigurace zůstane
+configure_agent() {
+  local interval=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval) interval="${2:-}"; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [ "$(id -u)" = 0 ] || die "configure must run as root (sudo)"
+  [ -r "$CONF" ] || die "missing $CONF (run: install first)"
+  valid_interval "$interval" || die "--interval must be one of: $INTERVALS"
+  local tmp
+  tmp="$(mktemp "$CONF.XXXXXX")"
+  grep -v '^INTERVAL=' "$CONF" >"$tmp" || true
+  printf 'INTERVAL=%s\n' "$interval" >>"$tmp"
+  chmod 0600 "$tmp"; chown root:root "$tmp"
+  mv -f "$tmp" "$CONF"
+  if [ "$(conf MODE 2>/dev/null || true)" = offline ]; then
+    RW_DIR="$(conf DIR)" schedule "$interval" norun
+  else
+    schedule "$interval" norun
   fi
 }
 
@@ -561,6 +618,7 @@ case "${1:-}" in
   run) shift; run_cmd "$@" ;;
   payload) payload ;;
   install) shift; install_agent "$@" ;;
+  configure) shift; configure_agent "$@" ;;
   update) shift; update_agent "$@" ;;
   uninstall) uninstall_agent ;;
   version) echo "$AGENT_VERSION" ;;
