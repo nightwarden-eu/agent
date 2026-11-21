@@ -28,7 +28,7 @@
 set -euo pipefail
 umask 077
 
-AGENT_VERSION="1.5.0"
+AGENT_VERSION="1.6.0"
 CONF="${PCVE_CONF:-/etc/nightwarden-agent.conf}"
 INTERVALS="4h 12h 1d 7d"  # #290: povolené četnosti hlášení (server zná stejný seznam, core.agent.INTERVALS)
 DEFAULT_INTERVAL="1d"
@@ -82,7 +82,8 @@ collect_packages() {
       raw() { dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\t${source:Package}\t${Version}\n' 2>/dev/null; }
     elif command -v rpm >/dev/null 2>&1; then
       fmt=rpm
-      raw() { rpm -qa --qf '%{NAME}\t\t%{VERSION}-%{RELEASE}\n' 2>/dev/null; }
+      # #347 (1.6.0): verze s epochou (1:3.0.7-27.el9) jako v opravách OSV; bez epochy jen verze-release
+      raw() { rpm -qa --qf '%{NAME}\t\t%|EPOCH?{%{EPOCH}:}:{}|%{VERSION}-%{RELEASE}\n' 2>/dev/null; }
     elif command -v apk >/dev/null 2>&1; then
       fmt=apk
       raw() { apk list -I 2>/dev/null; }
