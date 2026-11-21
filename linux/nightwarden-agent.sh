@@ -27,7 +27,7 @@
 set -euo pipefail
 umask 077
 
-AGENT_VERSION="1.3.0"
+AGENT_VERSION="1.4.0"
 CONF="${PCVE_CONF:-/etc/nightwarden-agent.conf}"
 INTERVALS="4h 12h 1d 7d"  # #290: povolené četnosti hlášení (server zná stejný seznam, core.agent.INTERVALS)
 DEFAULT_INTERVAL="1d"
@@ -319,10 +319,29 @@ send() {
     sleep $((attempt * 30))
   done
   case "$code" in
-    2??) echo "nightwarden-agent: report sent ($(wc -c <"$tmp") bytes): $(cat "$resp")" ;;
+    2??) save_machine_key "$resp"
+         # klíč stroje (#348) se nikdy nevypíše (výstup jde do logu cronu / journalu)
+         echo "nightwarden-agent: report sent ($(wc -c <"$tmp") bytes): $(sed 's/"machine_key": *"[^"]*"/"machine_key": "(saved)"/' "$resp")" ;;
     429) echo "nightwarden-agent: server asks to wait: $(cat "$resp")" >&2 ;;
     *) die "server answered HTTP $code: $(cat "$resp")" ;;
   esac
+}
+
+# #348 (1.4.0): server po prvním hlášení klíčem klienta vydá stroji VLASTNÍ klíč (jen jednou, v odpovědi). Uloží se do
+# konfigurace místo klíče klienta (atomicky, 0600 root) – klíč klienta na stroji nezůstane. Když se uložení nepovede,
+# agent skončí chybou a klíč nikam nevypíše; další hlášení klíčem klienta server odmítne (stroj má vlastní klíč) –
+# admin ho pak u stroje zruší a agent se znovu nainstaluje. Žádný návrat na klíč klienta (bez tichého fallbacku).
+save_machine_key() {  # $1 = soubor s odpovědí serveru
+  local mk tmp
+  mk="$(sed -n 's/.*"machine_key": *"\(pcve_[0-9a-f]\{8\}_[A-Za-z0-9_-]\{20,64\}\)".*/\1/p' "$1" | head -n 1)"
+  [ -n "$mk" ] || return 0
+  [ -r "$CONF" ] && [ ! -L "$CONF" ] || die "cannot save the machine key: $CONF missing or a symlink"
+  tmp="$(mktemp "$CONF.XXXXXX")" || die "cannot save the machine key (mktemp)"
+  chmod 0600 "$tmp"
+  { grep -v '^KEY=' "$CONF"; printf 'KEY=%s\n' "$mk"; } >"$tmp" || { rm -f "$tmp"; die "cannot save the machine key"; }
+  chown root:root "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$CONF" || { rm -f "$tmp"; die "cannot save the machine key"; }
+  echo "nightwarden-agent: this machine got its own key (saved in $CONF, the client key was removed)"
 }
 
 # --------------------------------------------------------------------------- instalace
