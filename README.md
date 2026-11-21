@@ -3,7 +3,7 @@
 Scripts of the [NightWarden](https://nightwarden.eu) inventory agent, published for independent verification.
 This repository only mirrors released files; the agent is installed from your NightWarden server.
 
-Agent 1.4.0. Every NightWarden release is a tag `vA.B.C` here (same version as the NightWarden server shows);
+Agent 1.5.0. Every NightWarden release is a tag `vA.B.C` here (same version as the NightWarden server shows);
 `SHA256SUMS` lists the SHA-256 of every script.
 
 ## Verify a script you downloaded from your NightWarden server

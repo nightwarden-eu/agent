@@ -7,6 +7,7 @@
 #                       klíč se zeptá na terminálu /dev/tty (bez echa; stdin je při `curl | bash` sám skript), nebo
 #                       --key-file /root/nw-key (0600, ne symlink), nebo NW_AGENT_KEY, když už běžíš jako root (sudo
 #                       proměnné zahazuje; `sudo NW_AGENT_KEY=… bash` by dal klíč do argumentů sudo);
+#                       --key-file - čte klíč / jednorázový token ze stdin (1.5.0, staženým skriptem);
 #                       --key pcve_… dál funguje, ale zůstane v historii a v `ps`
 #                       volitelně --ca /cesta/k/ca.pem (vlastní certifikační autorita, např. Caddy v domácí síti)
 #                       volitelně --interval 4h|12h|1d|7d (#290, jak často se hlásit; výchozí 1d = denně)
@@ -27,7 +28,7 @@
 set -euo pipefail
 umask 077
 
-AGENT_VERSION="1.4.0"
+AGENT_VERSION="1.5.0"
 CONF="${PCVE_CONF:-/etc/nightwarden-agent.conf}"
 INTERVALS="4h 12h 1d 7d"  # #290: povolené četnosti hlášení (server zná stejný seznam, core.agent.INTERVALS)
 DEFAULT_INTERVAL="1d"
@@ -366,7 +367,12 @@ hello() {  # $1 = URL, $2 = klíč, $3 = CA
 # Klíč nikdy jako argument jiného procesu, do výstupu ani do logu (jen builtiny bash: read, printf, case).
 read_key() {  # $1 = --key, $2 = --key-file; výsledek v proměnné KEY_VALUE
   local k="$1"
-  if [ -z "$k" ] && [ -n "$2" ]; then
+  if [ -z "$k" ] && [ "$2" = "-" ]; then
+    # #348 (1.5.0): klíč / jednorázový token ze stdin (`printf '%s\n' TOKEN | sudo bash nightwarden-agent.sh install
+    # … --key-file -`) – ne jako argument procesu; jen se staženým skriptem (při `curl | bash` je stdin skript)
+    [ ! -t 0 ] || die "--key-file -: pipe the key to stdin (or run without --key-file to be asked)"
+    IFS= read -r k || true
+  elif [ -z "$k" ] && [ -n "$2" ]; then
     # jen obyčejný soubor (ne symlink), který nečte nikdo jiný (0600 / 0400); po instalaci se nemaže
     [ ! -L "$2" ] || die "--key-file $2 is a symlink; use the file itself"
     [ -f "$2" ] && [ -r "$2" ] || die "--key-file $2 not readable"
