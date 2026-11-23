@@ -1,0 +1,33 @@
+# Windows agent test in the public repository (free standard runners for public repositories).
+# Published by agent_publish.py as .github/workflows/windows-agent.yml: on every release (main) and on candidate
+# branches (candidate/<hash>) pushed by hand before a release. Installs the agent on a clean Windows VM, reads the
+# configuration as Administrators and as SYSTEM, repairs, uninstalls. Nothing is sent (NW_AGENT_TEST_NO_SEND=1 inside
+# the test), no secrets, read-only token.
+name: Windows agent
+
+on:
+  push:
+    branches: [main, "candidate/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-agent:
+    name: Windows agent (install, SYSTEM, repair, uninstall)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Windows agent
+        shell: powershell
+        env:
+          NW_AGENT_PS1: windows/nightwarden-agent.ps1
+        run: .\tests\test-agent-windows.ps1

@@ -2,6 +2,8 @@
 
 Scripts of the [NightWarden](https://nightwarden.eu) inventory agent, published for independent verification.
 This repository only mirrors released files; the agent is installed from your NightWarden server.
+`tests/` and `.github/workflows/windows-agent.yml` run the Windows agent test on a clean Windows VM for every
+release (`main`) and for pre-release candidates (`candidate/*` branches; not a release, do not install from them).
 
 Agent 1.6.0. Every NightWarden release is a tag `vA.B.C` here (same version as the NightWarden server shows);
 `SHA256SUMS` lists the SHA-256 of every script.
