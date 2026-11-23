@@ -12,6 +12,10 @@
 #                       volitelně --ca /cesta/k/ca.pem (vlastní certifikační autorita, např. Caddy v domácí síti)
 #                       volitelně --interval 4h|12h|1d|7d (#290, jak často se hlásit; výchozí 1d = denně)
 #   Četnost (1.3.0):    sudo nightwarden-agent configure --interval 12h   (změní plánování, konfigurace zůstane)
+#   Kontejnery (1.7.0): sudo nightwarden-agent configure --containers     (--no-containers vypne; výchozí vypnuto)
+#                       Docker / rootový Podman: jen čtení (ps, image inspect, image save), žádné exec / run / pull.
+#                       Obsah image přes syft nebo trivy, jsou-li na stroji (agent nic nestahuje), jinak balíčky
+#                       dpkg / apk přečtené z vrstev image bez spuštění kontejneru (RPM image jen se syft / trivy).
 #   Ruční odeslání:     sudo nightwarden-agent run
 #   Aktualizace:        sudo nightwarden-agent update   (stáhne agenta ze serveru z konfigurace, atomicky nahradí)
 #                       sudo nightwarden-agent update --sha256 <hash>   (#210: jen se shodným SHA-256, např. z Release)
@@ -28,7 +32,7 @@
 set -euo pipefail
 umask 077
 
-AGENT_VERSION="1.6.0"
+AGENT_VERSION="1.7.0"
 CONF="${PCVE_CONF:-/etc/nightwarden-agent.conf}"
 INTERVALS="4h 12h 1d 7d"  # #290: povolené četnosti hlášení (server zná stejný seznam, core.agent.INTERVALS)
 DEFAULT_INTERVAL="1d"
@@ -323,7 +327,10 @@ send() {
   case "$code" in
     2??) save_machine_key "$resp"
          # klíč stroje (#348) se nikdy nevypíše (výstup jde do logu cronu / journalu)
-         echo "nightwarden-agent: report sent ($(wc -c <"$tmp") bytes): $(sed 's/"machine_key": *"[^"]*"/"machine_key": "(saved)"/' "$resp")" ;;
+         echo "nightwarden-agent: report sent ($(wc -c <"$tmp") bytes): $(sed 's/"machine_key": *"[^"]*"/"machine_key": "(saved)"/' "$resp")"
+         # v podshellu: vlastní úklid (trap) a chyba kontejnerů nikdy neshodí hlášení balíčků
+         [ "$(conf CONTAINERS)" = 1 ] && { ( containers_send ) || echo "nightwarden-agent: containers: failed ($?)" >&2; }
+         true ;;
     429) echo "nightwarden-agent: server asks to wait: $(cat "$resp")" >&2 ;;
     *) die "server answered HTTP $code: $(cat "$resp")" ;;
   esac
@@ -344,6 +351,247 @@ save_machine_key() {  # $1 = soubor s odpovědí serveru
   chown root:root "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$CONF" || { rm -f "$tmp"; die "cannot save the machine key"; }
   echo "nightwarden-agent: this machine got its own key (saved in $CONF, the client key was removed)"
+}
+
+# --------------------------------------------------------------------------- kontejnery (1.7.0, #338)
+#
+# Bezpečnost (agent běží jako root): do příkazů jde jen ID image ověřené regexem ^sha256:[0-9a-f]{64}$; názvy, tagy
+# a labely nikdy do shellu ani do argumentů (jen do JSON přes jstr a do URL přes urlenc). Jen čtecí příkazy runtime
+# (ps, image inspect, image save) – žádné exec / run / create / pull. Limity: 50 image na hlášení, 120 s na image,
+# image > 4 GB se přeskočí, nice / ionice, dočasné soubory v mktemp -d s úklidem.
+
+CT_MAX_IMAGES=50
+CT_TIMEOUT=120
+CT_MAX_BYTES=$((2 * 1024 * 1024 * 1024))   # větší image se přeskočí (review #417: dřív 4 GB)
+CT_BUDGET="${PCVE_CT_BUDGET:-900}"         # celkový čas na SBOM v jednom běhu (15 min); zbytek příště (server vrátí need)
+CT_LOCK="${ROOT}/run/nightwarden-agent-containers.lock"
+
+ct_workdir() {  # pracovní složka mimo /tmp (často tmpfs = RAM): WORKDIR z konfigurace, jinak /var/tmp
+  local d
+  d="$(conf WORKDIR 2>/dev/null || true)"
+  [[ -n "$d" && -d "$d" ]] || d=/var/tmp
+  mktemp -d "$d/nightwarden-ct.XXXXXX"
+}
+
+ct_free_kb() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 + 0 }'; }
+
+ct_lock() {  # jeden běh kontejnerů najednou (timer + ruční run); podshell drží zámek do konce
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"$CT_LOCK" 2>/dev/null || return 0  # bez /run (nezvyklý systém) bez zámku
+    flock -n 8 || return 1
+    return 0
+  fi
+  if mkdir "$CT_LOCK.d" 2>/dev/null; then
+    trap "rm -rf '$CT_LOCK.d'" EXIT
+    return 0
+  fi
+  # zámek starší než 2 h = po pádu, převzít
+  if [[ -n "$(find "$CT_LOCK.d" -maxdepth 0 -mmin +120 2>/dev/null)" ]]; then
+    rm -rf "$CT_LOCK.d"; mkdir "$CT_LOCK.d" 2>/dev/null && { trap "rm -rf '$CT_LOCK.d'" EXIT; return 0; }
+  fi
+  return 1
+}
+
+ct_runtime() {  # docker, jinak rootový podman (kontejnery jiných uživatelů ne)
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then echo docker; return; fi
+  if command -v podman >/dev/null 2>&1; then echo podman; return; fi
+  return 1
+}
+
+ct_id_ok() { [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]]; }
+
+ct_slow() {  # spustí příkaz s nižší prioritou a časovým limitem (bez shellu: argumenty se předávají beze změny)
+  local pre=()
+  command -v timeout >/dev/null 2>&1 && pre+=(timeout "$CT_TIMEOUT")
+  command -v nice >/dev/null 2>&1 && pre+=(nice -n 19)
+  command -v ionice >/dev/null 2>&1 && pre+=(ionice -c 3)
+  "${pre[@]}" "$@"
+}
+
+urlenc() {  # bajt po bajtu, jen nerezervované znaky beze změny
+  local LC_ALL=C s="$1" out="" c i hex
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [A-Za-z0-9._~-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# Běžící kontejnery -> "<počet> <sha256:id>" na řádek (jen ověřená ID, nejvýš CT_MAX_IMAGES)
+ct_images() {  # $1 = runtime
+  "$1" ps --no-trunc --format '{{.ImageID}}' 2>/dev/null | awk '
+    { id = $0; if (id ~ /^[0-9a-f]{64}$/) id = "sha256:" id; if (id ~ /^sha256:[0-9a-f]{64}$/) n[id]++ }
+    END { for (i in n) print n[i], i }' | sort -k2 | head -n "$CT_MAX_IMAGES"
+}
+
+ct_tags() {  # $1 = runtime, $2 = ověřené ID -> tagy po řádcích (data, ne příkazy)
+  "$1" image inspect --format '{{range .RepoTags}}{{println .}}{{end}}' "$2" 2>/dev/null | awk 'NF && NR <= 10'
+}
+
+ct_size() {  # $1 = runtime, $2 = ověřené ID -> velikost v bajtech (neznámá = 0)
+  local n
+  n="$("$1" image inspect --format '{{.Size}}' "$2" 2>/dev/null | head -n 1)"
+  [[ "$n" =~ ^[0-9]{1,15}$ ]] && echo "$n" || echo 0
+}
+
+# OS balíčky z vrstev image bez spuštění kontejneru: `image save` -> manifest.json -> vrstvy v pořadí; z každé jen
+# os-release a databáze dpkg / apk (nejvyšší vrstva vyhrává, whiteout .wh. maže). Výstup = CycloneDX JSON.
+ct_layers_sbom() {  # $1 = runtime, $2 = ověřené ID, $3 = pracovní složka
+  local rt="$1" id="$2" w="$3" layer f members list osid osver
+  local files="etc/os-release usr/lib/os-release var/lib/dpkg/status lib/apk/db/installed"
+  # jen GNU tar: busybox tar (Alpine hostitel) neumí spolehlivě --no-same-owner / --no-same-permissions ani vybírat
+  # jednotlivé soubory ze vrstvy – raději žádná data než chybná (review #417)
+  tar --version 2>/dev/null | head -n 1 | grep -q 'GNU tar' || return 6
+  mkdir -p "$w/fs" "$w/x"
+  ct_slow "$rt" image save "$id" >"$w/img.tar" 2>/dev/null || return 3
+  tar -xf "$w/img.tar" -C "$w/x" manifest.json 2>/dev/null || return 3
+  list="$(tr -d '\n' <"$w/x/manifest.json" | grep -o '"Layers"[[:space:]]*:[[:space:]]*\[[^]]*\]' | head -n 1 |
+          sed 's/^"Layers"[^[]*//' | grep -o '"[^"]*"' | tr -d '"')" || return 3
+  for layer in $list; do
+    # cesta vrstvy z manifestu jen jako bezpečný relativní název uvnitř archivu
+    [[ "$layer" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ "$layer" != *..* ]] && [[ "$layer" != /* ]] || return 3
+    tar -xf "$w/img.tar" -C "$w/x" -- "$layer" 2>/dev/null || return 3
+    members="$(tar -tf "$w/x/$layer" 2>/dev/null | sed 's#^\./##')" || { rm -f "$w/x/$layer"; return 3; }
+    for f in $files; do
+      local d="${f%/*}" b="${f##*/}"
+      if grep -qxF -e "$d/.wh.$b" -e "$d/.wh..wh..opq" <<<"$members"; then rm -f "$w/fs/$f"; fi
+      if grep -qxF -e "$f" -e "./$f" <<<"$members"; then
+        rm -f "$w/fs/$f"
+        tar -xf "$w/x/$layer" -C "$w/fs" --no-same-owner --no-same-permissions -- "$f" 2>/dev/null ||
+          tar -xf "$w/x/$layer" -C "$w/fs" --no-same-owner --no-same-permissions -- "./$f" 2>/dev/null || true
+      fi
+    done
+    rm -f "$w/x/$layer"
+  done
+  rm -f "$w/img.tar"
+  for f in $files; do  # jen obyčejné soubory uvnitř pracovní složky (symlink z image by vedl na soubor hostitele)
+    if [ -L "$w/fs/$f" ] || { [ -e "$w/fs/$f" ] && [ ! -f "$w/fs/$f" ]; }; then rm -f "$w/fs/$f"; fi
+  done
+  f="$w/fs/etc/os-release"; [ -f "$f" ] || f="$w/fs/usr/lib/os-release"
+  osid="$( [ -f "$f" ] && sed -n 's/^ID="\{0,1\}\([a-z0-9._-]*\)"\{0,1\}$/\1/p' "$f" | head -n 1)"
+  osver="$( [ -f "$f" ] && sed -n 's/^VERSION_ID="\{0,1\}\([A-Za-z0-9._-]*\)"\{0,1\}$/\1/p' "$f" | head -n 1)"
+  if [ -f "$w/fs/var/lib/dpkg/status" ]; then
+    awk -v RS= -F '\n' '{ name = ver = src = ""; ok = 0
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^Package: /) name = substr($i, 10)
+          else if ($i ~ /^Version: /) ver = substr($i, 10)
+          else if ($i ~ /^Source: /) { src = substr($i, 9); sub(/ .*/, "", src) }
+          else if ($i ~ /^Status: .* installed$/) ok = 1 }
+        if (ok && name != "" && ver != "") print name "\t" src "\t" ver }' "$w/fs/var/lib/dpkg/status" |
+      ct_cyclonedx deb "${osid:-debian}" "$osver"
+  elif [ -f "$w/fs/lib/apk/db/installed" ]; then
+    awk -v RS= -F '\n' '{ name = ver = src = ""
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^P:/) name = substr($i, 3); else if ($i ~ /^V:/) ver = substr($i, 3)
+          else if ($i ~ /^o:/) src = substr($i, 3) }
+        if (name != "" && ver != "") print name "\t" src "\t" ver }' "$w/fs/lib/apk/db/installed" |
+      ct_cyclonedx apk "${osid:-alpine}" "$osver"
+  else
+    return 4  # RPM nebo bez správce balíčků: jen se syft / trivy
+  fi
+}
+
+# TSV "jméno<TAB>zdroj<TAB>verze" -> CycloneDX 1.5 s purl pkg:<typ>/<distro>/<jméno>@<verze>?distro=<id>-<verze>
+ct_cyclonedx() {  # $1 = deb / apk, $2 = ID distribuce, $3 = VERSION_ID
+  awk -F '\t' -v t="$1" -v os="$2" -v ver="$3" -v agent="$AGENT_VERSION" '
+    function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/[\001-\037\177]/, "", s); return s }
+    function pe(s,   out, i, c) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1)
+        out = out (c ~ /[A-Za-z0-9._~+:-]/ ? c : sprintf("%%%02X", ord[c])) } return out }
+    BEGIN { ORS = ""; for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
+      print "{\"bomFormat\":\"CycloneDX\",\"specVersion\":\"1.5\",\"metadata\":{\"tools\":[{\"name\":\"nightwarden-agent\",\"version\":\"" agent "\"}]},\"components\":["; n = 0 }
+    $1 != "" && $3 != "" { if (n++) print ","
+      q = (ver != "" ? "?distro=" pe(os "-" ver) : "")
+      if ($2 != "" && $2 != $1) q = q (q == "" ? "?" : "&") "upstream=" pe($2)
+      print "{\"type\":\"library\",\"name\":\"" esc($1) "\",\"version\":\"" esc($3) "\",\"purl\":\"pkg:" t "/" pe(os) "/" pe($1) "@" pe($3) q "\"}" }
+    END { print "]}\n" }'
+}
+
+ct_sbom() {  # $1 = runtime, $2 = ověřené ID, $3 = výstupní soubor; 0 = SBOM hotový
+  local rt="$1" id="$2" out="$3" w rc=0
+  w="$(mktemp -d "${out%/*}/sbom.XXXXXX")"  # v pracovní složce běhu (ne /tmp); syft / trivy tam mají i TMPDIR
+  if command -v syft >/dev/null 2>&1 &&
+     TMPDIR="$w" ct_slow syft -q "$rt:$id" -o cyclonedx-json >"$out" 2>/dev/null && [ -s "$out" ]; then
+    rm -rf "$w"; return 0; fi
+  if command -v trivy >/dev/null 2>&1 &&
+     TMPDIR="$w" ct_slow trivy image --quiet --format cyclonedx --skip-db-update --offline-scan --image-src "$rt" "$id" \
+       >"$out" 2>/dev/null && [ -s "$out" ]; then rm -rf "$w"; return 0; fi
+  ct_layers_sbom "$rt" "$id" "$w" >"$out" || rc=$?
+  rm -rf "$w"
+  [ "$rc" = 0 ] && [ -s "$out" ] || return "${rc/#0/5}"
+}
+
+ct_post() {  # $1 = cesta API (+ query), $2 = soubor s tělem, $3 = soubor pro odpověď -> HTTP kód na stdout
+  local url key ca hdr code
+  url="$(conf URL)"; key="$(conf KEY)"; ca="$(conf CA)"
+  hdr="$(mktemp)"
+  printf 'Authorization: Bearer %s\nContent-Type: application/json\nUser-Agent: nightwarden-agent/%s\n' \
+    "$key" "$AGENT_VERSION" >"$hdr"
+  code="$(curl --silent --show-error --proto =https --proto-redir =https --connect-timeout 20 --max-time 300 \
+          --header @"$hdr" ${ca:+--cacert "$ca"} --data-binary @"$2" --output "$3" --write-out '%{http_code}' \
+          "${url%/}$1")" || code="000"
+  rm -f "$hdr"
+  echo "$code"
+}
+
+containers_send() {
+  local rt w n id first q code sent=0 skipped=0 size need_kb deadline rc
+  rt="$(ct_runtime)" || { echo "nightwarden-agent: containers: no docker / podman found"; return 0; }
+  ct_lock || { echo "nightwarden-agent: containers: another run is in progress, skipped"; return 0; }
+  deadline=$(( $(date +%s) + CT_BUDGET ))
+  w="$(ct_workdir)" || { echo "nightwarden-agent: containers: cannot create a work directory" >&2; return 0; }
+  trap "rm -rf '$w'" EXIT  # běží v podshellu (viz send): trap rodiče se nemění
+  ct_images "$rt" >"$w/list"
+  { printf '{"images":['
+    first=1
+    while read -r n id; do
+      ct_id_ok "$id" || continue
+      [ -n "$first" ] || printf ','
+      first=""
+      printf '{"digest":"%s","containers":%d,"tags":[' "$id" "$n"
+      ct_tags "$rt" "$id" | { t1=1; while IFS= read -r tag; do [ -n "$t1" ] || printf ','; t1=""; jstr "$tag"; done; }
+      printf ']}'
+    done <"$w/list"
+    printf ']}'; } >"$w/images.json"
+  code="$(ct_post /api/v1/agent/containers "$w/images.json" "$w/resp")"
+  case "$code" in 2??) ;; *) echo "nightwarden-agent: containers: server answered HTTP $code: $(cat "$w/resp")" >&2; return 0 ;; esac
+  for id in $(grep -o 'sha256:[0-9a-f]\{64\}' "$w/resp" | sort -u | head -n "$CT_MAX_IMAGES"); do
+    ct_id_ok "$id" || continue
+    n="$(awk -v id="$id" '$2 == id { print $1 }' "$w/list")"
+    [ -n "$n" ] || continue  # server smí žádat jen o image z našeho seznamu
+    if [ "$(date +%s)" -ge "$deadline" ]; then  # zbytek v příštím běhu (server ho vrátí v need znovu)
+      echo "nightwarden-agent: containers: time budget ($CT_BUDGET s) used, the rest next run"; break
+    fi
+    size="$(ct_size "$rt" "$id")"
+    if [ "$size" -gt "$CT_MAX_BYTES" ]; then
+      echo "nightwarden-agent: containers: ${id:7:12} larger than 2 GB, skipped"; skipped=$((skipped + 1)); continue
+    fi
+    need_kb=$(( (size > 0 ? size : 256 * 1024 * 1024) * 2 / 1024 ))  # 2× velikost image (neznámá = 512 MB)
+    if [ "$(ct_free_kb "$w")" -lt "$need_kb" ]; then
+      echo "nightwarden-agent: containers: ${id:7:12}: not enough free space in ${w%/*} (need $((need_kb / 1024)) MB), skipped"
+      skipped=$((skipped + 1)); continue
+    fi
+    rc=0
+    ct_sbom "$rt" "$id" "$w/sbom.json" || rc=$?
+    if [ "$rc" != 0 ]; then
+      case "$rc" in
+        6) echo "nightwarden-agent: containers: ${id:7:12}: reading layers needs GNU tar (install tar, syft or trivy)" ;;
+        *) echo "nightwarden-agent: containers: ${id:7:12}: no package data (RPM image: install syft or trivy)" ;;
+      esac
+      skipped=$((skipped + 1)); continue
+    fi
+    q="?digest=$id&containers=$n"
+    while IFS= read -r tag; do q="$q&tag=$(urlenc "$tag")"; done < <(ct_tags "$rt" "$id")
+    code="$(ct_post "/api/v1/agent/containers/sbom$q" "$w/sbom.json" "$w/resp")"
+    case "$code" in
+      2??) sent=$((sent + 1)) ;;
+      *) echo "nightwarden-agent: containers: ${id:7:12}: server answered HTTP $code: $(cat "$w/resp")" >&2 ;;
+    esac
+  done
+  echo "nightwarden-agent: containers: $(wc -l <"$w/list") images running, $sent SBOM sent, $skipped skipped"
+  rm -rf "$w"
 }
 
 # --------------------------------------------------------------------------- instalace
@@ -400,10 +648,11 @@ read_key() {  # $1 = --key, $2 = --key-file; výsledek v proměnné KEY_VALUE
 }
 
 install_agent() {
-  local url="" key="" keyfile="" ca="" offline="" dir="" prefix="" interval="$DEFAULT_INTERVAL"
+  local url="" key="" keyfile="" ca="" offline="" dir="" prefix="" interval="$DEFAULT_INTERVAL" containers=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --offline) offline=1; shift ;;
+      --containers) containers=1; shift ;;
       --interval) interval="${2:-}"; shift 2 ;;
       --dir) dir="${2:-}"; shift 2 ;;
       --key-prefix) prefix="${2:-}"; shift 2 ;;
@@ -433,7 +682,7 @@ install_agent() {
   else  # spuštěno přes rouru (curl … | bash): skript stáhnout znovu, jen stejnou verzi (#125)
     fetch_agent "$url" "$ca" same
   fi
-  printf 'URL=%s\nKEY=%s\nCA=%s\nINTERVAL=%s\n' "$url" "$key" "$ca" "$interval" >"$CONF"
+  printf 'URL=%s\nKEY=%s\nCA=%s\nINTERVAL=%s\nCONTAINERS=%s\n' "$url" "$key" "$ca" "$interval" "$containers" >"$CONF"
   chmod 0600 "$CONF"; chown root:root "$CONF"
   if [ -e "$ROOT/etc/$LEGACY.conf" ] || [ -e "$ROOT/usr/local/sbin/$LEGACY" ]; then
     remove_legacy
@@ -544,23 +793,36 @@ EOF
 }
 
 # configure --interval X (#290): změní četnost u nainstalovaného agenta; ostatní konfigurace zůstane
+set_conf() {  # $1 = klíč, $2 = hodnota: atomicky, 0600 root (ostatní řádky zůstávají)
+  local tmp
+  tmp="$(mktemp "$CONF.XXXXXX")"
+  grep -v "^$1=" "$CONF" >"$tmp" || true
+  printf '%s=%s\n' "$1" "$2" >>"$tmp"
+  chmod 0600 "$tmp"; chown root:root "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$CONF"
+}
+
 configure_agent() {
-  local interval=""
+  local interval="" containers=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --interval) interval="${2:-}"; shift 2 ;;
+      --containers) containers=1; shift ;;
+      --no-containers) containers=0; shift ;;
       *) die "unknown option $1" ;;
     esac
   done
   [ "$(id -u)" = 0 ] || die "configure must run as root (sudo)"
   [ -r "$CONF" ] || die "missing $CONF (run: install first)"
+  [ -n "$interval" ] || [ -n "$containers" ] || die "nothing to change: use --interval or --containers / --no-containers"
+  if [ -n "$containers" ]; then
+    set_conf CONTAINERS "$containers"
+    if [ "$containers" = 1 ]; then echo "nightwarden-agent: containers on (Docker / Podman images in the next report)"
+    else echo "nightwarden-agent: containers off"; fi
+    [ -n "$interval" ] || return 0
+  fi
   valid_interval "$interval" || die "--interval must be one of: $INTERVALS"
-  local tmp
-  tmp="$(mktemp "$CONF.XXXXXX")"
-  grep -v '^INTERVAL=' "$CONF" >"$tmp" || true
-  printf 'INTERVAL=%s\n' "$interval" >>"$tmp"
-  chmod 0600 "$tmp"; chown root:root "$tmp"
-  mv -f "$tmp" "$CONF"
+  set_conf INTERVAL "$interval"
   if [ "$(conf MODE 2>/dev/null || true)" = offline ]; then
     RW_DIR="$(conf DIR)" schedule "$interval" norun
   else
