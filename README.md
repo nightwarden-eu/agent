@@ -5,7 +5,7 @@ This repository only mirrors released files; the agent is installed from your Ni
 `tests/` and `.github/workflows/windows-agent.yml` run the Windows agent test on a clean Windows VM for every
 release (`main`) and for pre-release candidates (`candidate/*` branches; not a release, do not install from them).
 
-Agent 1.7.0. Every NightWarden release is a tag `vA.B.C` here (same version as the NightWarden server shows);
+Agent 1.7.1. Every NightWarden release is a tag `vA.B.C` here (same version as the NightWarden server shows);
 `SHA256SUMS` lists the SHA-256 of every script.
 
 ## Verify a script you downloaded from your NightWarden server

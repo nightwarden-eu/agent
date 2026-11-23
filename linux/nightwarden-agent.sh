@@ -32,7 +32,7 @@
 set -euo pipefail
 umask 077
 
-AGENT_VERSION="1.7.0"
+AGENT_VERSION="1.7.1"
 CONF="${PCVE_CONF:-/etc/nightwarden-agent.conf}"
 INTERVALS="4h 12h 1d 7d"  # #290: povolené četnosti hlášení (server zná stejný seznam, core.agent.INTERVALS)
 DEFAULT_INTERVAL="1d"
@@ -375,19 +375,22 @@ ct_workdir() {  # pracovní složka mimo /tmp (často tmpfs = RAM): WORKDIR z ko
 
 ct_free_kb() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 + 0 }'; }
 
+CT_CLEANUP=()  # 1.7.1: vše k úklidu po běhu kontejnerů (pracovní složka, zámek mkdir) – JEDEN trap (review #417)
+ct_cleanup() { local d; for d in "${CT_CLEANUP[@]}"; do rm -rf -- "$d"; done; }
+
 ct_lock() {  # jeden běh kontejnerů najednou (timer + ruční run); podshell drží zámek do konce
-  if command -v flock >/dev/null 2>&1; then
+  if [[ -z "${PCVE_NO_FLOCK:-}" ]] && command -v flock >/dev/null 2>&1; then  # PCVE_NO_FLOCK jen testy
     exec 8>"$CT_LOCK" 2>/dev/null || return 0  # bez /run (nezvyklý systém) bez zámku
     flock -n 8 || return 1
     return 0
   fi
   if mkdir "$CT_LOCK.d" 2>/dev/null; then
-    trap "rm -rf '$CT_LOCK.d'" EXIT
+    CT_CLEANUP+=("$CT_LOCK.d")
     return 0
   fi
   # zámek starší než 2 h = po pádu, převzít
   if [[ -n "$(find "$CT_LOCK.d" -maxdepth 0 -mmin +120 2>/dev/null)" ]]; then
-    rm -rf "$CT_LOCK.d"; mkdir "$CT_LOCK.d" 2>/dev/null && { trap "rm -rf '$CT_LOCK.d'" EXIT; return 0; }
+    rm -rf "$CT_LOCK.d"; mkdir "$CT_LOCK.d" 2>/dev/null && { CT_CLEANUP+=("$CT_LOCK.d"); return 0; }
   fi
   return 1
 }
@@ -540,9 +543,10 @@ containers_send() {
   local rt w n id first q code sent=0 skipped=0 size need_kb deadline rc
   rt="$(ct_runtime)" || { echo "nightwarden-agent: containers: no docker / podman found"; return 0; }
   ct_lock || { echo "nightwarden-agent: containers: another run is in progress, skipped"; return 0; }
+  trap ct_cleanup EXIT  # jediný trap (podshell, viz send) hned po zámku: zámek mkdir i pracovní složka
   deadline=$(( $(date +%s) + CT_BUDGET ))
   w="$(ct_workdir)" || { echo "nightwarden-agent: containers: cannot create a work directory" >&2; return 0; }
-  trap "rm -rf '$w'" EXIT  # běží v podshellu (viz send): trap rodiče se nemění
+  CT_CLEANUP+=("$w")
   ct_images "$rt" >"$w/list"
   { printf '{"images":['
     first=1
