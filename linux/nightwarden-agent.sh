@@ -32,7 +32,7 @@
 set -euo pipefail
 umask 077
 
-AGENT_VERSION="1.7.1"
+AGENT_VERSION="1.8.0"
 CONF="${PCVE_CONF:-/etc/nightwarden-agent.conf}"
 INTERVALS="4h 12h 1d 7d"  # #290: povolené četnosti hlášení (server zná stejný seznam, core.agent.INTERVALS)
 DEFAULT_INTERVAL="1d"
@@ -841,7 +841,7 @@ version_lt() {  # $1 < $2 (sort -V)
 
 fetch_agent() {  # $1 URL, $2 CA, $3 same = jen stejná verze jako běžící skript (instalace rourou), jinak ne nižší
                  # $4 očekávaný SHA-256 (#210, update --sha256; prázdné = bez kontroly)
-  local new="$BIN.new" got
+  local new="$BIN.new"
   rm -f "$new"
   if ! curl -fsS --proto =https --proto-redir =https ${2:+--cacert "$2"} -o "$new" "${1%/}/agent/nightwarden-agent.sh"; then
     rm -f "$new"; die "cannot download the agent from ${1}"
@@ -849,14 +849,22 @@ fetch_agent() {  # $1 URL, $2 CA, $3 same = jen stejná verze jako běžící sk
   if [ -n "${4:-}" ] && [ "$(sha256sum "$new" | cut -d' ' -f1)" != "$4" ]; then
     rm -f "$new"; die "SHA-256 of the downloaded agent does not match $4; nothing installed"
   fi
+  install_new "$new" "${3:-}" ""
+}
+
+install_new() {  # $1 stažený soubor ($BIN.new), $2 same = stejná verze jako běžící, $3 ohlášená verze (prázdné = neznámá)
+  local new="$1" got
   if ! grep -q 'nightwarden-agent' "$new" || ! bash -n "$new"; then
     rm -f "$new"; die "downloaded file is not a valid agent script"
   fi
   # #125: server smí dát jen tutéž verzi (instalace rourou: nainstaluje se to, co se spustilo), při update ne nižší
   got="$(sed -n 's/^AGENT_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$new" | head -n 1)"
   [ -n "$got" ] || { rm -f "$new"; die "downloaded file is not a valid agent script (no version)"; }
-  if [ "${3:-}" = same ] && [ "$got" != "$AGENT_VERSION" ]; then
+  if [ "${2:-}" = same ] && [ "$got" != "$AGENT_VERSION" ]; then
     rm -f "$new"; die "the server sent a different agent version ($got) than the one running ($AGENT_VERSION); download the script again and run it"
+  fi
+  if [ -n "${3:-}" ] && [ "$got" != "$3" ]; then
+    rm -f "$new"; die "downloaded agent is version $got, the server announced $3; nothing installed"
   fi
   if version_lt "$got" "$AGENT_VERSION"; then
     rm -f "$new"; die "refusing to downgrade the agent from $AGENT_VERSION to $got"
@@ -865,8 +873,54 @@ fetch_agent() {  # $1 URL, $2 CA, $3 same = jen stejná verze jako běžící sk
   mv -f "$new" "$BIN"
 }
 
-update_agent() {  # 1.1.0: aktualizace jedním příkazem, konfigurace (URL, klíč, CA) zůstává
-  local url ca sha=""
+# #383 PR 2 (1.8.0): na co aktualizovat. Server (klíč jen v souboru s hlavičkou) vrátí verzi, SHA-256 a soubor na
+# tagu verze ve veřejném repu. Výstup "verze sha url" (url může chybět), nebo "old sha" u staršího serveru bez
+# endpointu (hash z jeho /agent/nightwarden-agent.sh.sha256). Hash je vždy, jinak se končí chybou.
+update_target() {  # $1 URL, $2 klíč, $3 CA
+  local hdr resp code ver sha src rc=0
+  hdr="$(mktemp)"; resp="$(mktemp)"
+  printf 'Authorization: Bearer %s\nUser-Agent: nightwarden-agent/%s\n' "$2" "$AGENT_VERSION" >"$hdr"
+  code="$(curl --silent --show-error --proto =https --proto-redir =https --connect-timeout 20 --max-time 60 \
+          --header @"$hdr" ${3:+--cacert "$3"} --output "$resp" --write-out '%{http_code}' \
+          "${1%/}/api/v1/agent/update")" || rc=$?
+  rm -f "$hdr"
+  [ "$rc" = 0 ] || { rm -f "$resp"; die "cannot reach ${1} (curl error $rc, e.g. 60 = untrusted certificate: use --ca)"; }
+  case "$code" in
+    200)
+      ver="$(sed -n 's/.*"version": *"\([0-9][0-9.]*\)".*/\1/p' "$resp" | head -n 1)"
+      sha="$(sed -n 's/.*"sha256": *"\([0-9a-f]\{64\}\)".*/\1/p' "$resp" | head -n 1)"
+      # jen soubor ve veřejném repu nightwarden-eu/agent; cokoli jiného se ignoruje (pak jen zrcadlo)
+      src="$(sed -n 's|.*"url": *"\(https://raw\.githubusercontent\.com/nightwarden-eu/agent/v[0-9][0-9.]*/linux/nightwarden-agent\.sh\)".*|\1|p' "$resp" | head -n 1)"
+      rm -f "$resp"
+      [ -n "$ver" ] && [ -n "$sha" ] || die "the server sent an invalid update answer; nothing installed"
+      echo "$ver $sha $src" ;;
+    404)  # starší server (do #383): hash jeho souboru z /agent/nightwarden-agent.sh.sha256
+      rm -f "$resp"
+      sha="$(curl -fsS --proto =https --proto-redir =https --connect-timeout 20 --max-time 60 ${3:+--cacert "$3"} \
+             "${1%/}/agent/nightwarden-agent.sh.sha256" | sed -n 's/^\([0-9a-f]\{64\}\).*/\1/p' | head -n 1)" || true
+      [ -n "$sha" ] || die "cannot get the SHA-256 of the agent from ${1}; nothing installed"
+      echo "old $sha" ;;
+    *) rm -f "$resp"; die "the server refused the update check (HTTP $code); nothing installed" ;;
+  esac
+}
+
+download_checked() {  # $1 URL souboru, $2 CA (prázdné = systémové), $3 očekávaný SHA-256, $4 popis zdroje -> 0 = $BIN.new
+  local new="$BIN.new" got
+  rm -f "$new"
+  # anonymní GET: žádná hlavička s klíčem; strop velikosti (skript má desítky kB)
+  if ! curl -fsS --proto =https --proto-redir =https --connect-timeout 20 --max-time 120 --max-filesize 2000000 \
+       ${2:+--cacert "$2"} -o "$new" "$1"; then
+    rm -f "$new"; echo "nightwarden-agent: cannot download the agent from $4" >&2; return 1
+  fi
+  got="$(sha256sum "$new" | cut -d' ' -f1)"
+  if [ "$got" != "$3" ]; then
+    rm -f "$new"; echo "nightwarden-agent: SHA-256 of the agent from $4 does not match the server ($got); not used" >&2
+    return 1
+  fi
+}
+
+update_agent() {  # 1.1.0: aktualizace jedním příkazem, konfigurace (URL, klíč, CA) zůstává; 1.8.0 (#383): z veřejného repa
+  local url ca key sha="" target ver want src
   while [ $# -gt 0 ]; do
     case "$1" in
       # review #212: bez hodnoty / s prázdnou hodnotou chyba (dřív tiše „bez kontroly“, chybějící argument = shift 2)
@@ -878,9 +932,29 @@ update_agent() {  # 1.1.0: aktualizace jedním příkazem, konfigurace (URL, kl�
   case "$sha" in "") ;; *[!0-9a-f]*) die "--sha256 needs 64 hexadecimal characters" ;; *) [ ${#sha} = 64 ] || die "--sha256 needs 64 hexadecimal characters" ;; esac
   [ "$(id -u)" = 0 ] || die "update must run as root (sudo)"
   [ "$(conf MODE)" != offline ] || die "offline install: copy the new script to the machine and run install --offline again"
-  url="$(conf URL)"; ca="$(conf CA)"
+  url="$(conf URL)"; ca="$(conf CA)"; key="$(conf KEY)"
   case "$url" in https://*) ;; *) die "URL must start with https://";; esac
-  fetch_agent "$url" "$ca" "" "$sha"
+  [ -n "$key" ] || die "KEY is empty in $CONF"
+  target="$(update_target "$url" "$key" "$ca")" || exit 1
+  set -- $target
+  ver="$1"; want="$2"; src="${3:-}"
+  [ "$ver" = old ] && ver=""
+  if [ -n "$sha" ] && [ "$sha" != "$want" ]; then
+    die "--sha256 does not match the SHA-256 announced by the server ($want); nothing installed"
+  fi
+  if [ -n "$ver" ] && ! version_lt "$AGENT_VERSION" "$ver"; then
+    echo "nightwarden-agent: up to date ($AGENT_VERSION)"
+    return 0
+  fi
+  # 1) veřejné repo (anonymně, systémové CA), 2) zrcadlo = vlastní server; obojí s hashem od serveru
+  if [ -n "$src" ] && download_checked "$src" "" "$want" "github.com/nightwarden-eu/agent"; then
+    :
+  elif download_checked "${url%/}/agent/nightwarden-agent.sh" "$ca" "$want" "$url"; then
+    [ -z "$src" ] || echo "nightwarden-agent: used the mirror on ${url%/}" >&2
+  else
+    die "update failed, the installed agent ($AGENT_VERSION) stays and keeps reporting"
+  fi
+  install_new "$BIN.new" "" "$ver"
   echo "nightwarden-agent: updated to $("$BIN" version); sending a report now"
   "$BIN" run
 }
